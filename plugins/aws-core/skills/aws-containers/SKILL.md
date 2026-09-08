@@ -1,9 +1,9 @@
 ---
 name: aws-containers
-description: Builds and deploys containerized workloads on Elastic Kubernetes Service (EKS), Elastic Container Service (ECS), Fargate, and ECR (Elastic Container Registry). Covers general EKS knowledge, Karpenter, AWS Load Balancer Controller and leveraging various open source Kubernetes projects with EKS. Covers general ECS knowledge, task definitions, Fargate services, ECS Exec, ECS Express Mode and ECS Managed Instances. Covers general Elastic Beanstalk knowledge, Elastic Beanstalk configuration and platforms supported by Elastic Beanstalk. Covers general ECR knowledge, ECR repository setup and lifecycle policies. Applies when deploying, debugging, or optimizing containers on AWS. Should be used instead of relying on internal knowledge for these services.
+description: Builds and deploys containerized workloads on Elastic Kubernetes Service (EKS), Elastic Container Service (ECS), Fargate, ECR (Elastic Container Registry), and Elastic Beanstalk, including Beanstalk Cluster Mode. Covers general EKS knowledge, Karpenter, AWS Load Balancer Controller and leveraging various open source Kubernetes projects with EKS. Covers general ECS knowledge, task definitions, Fargate services, ECS Exec, ECS Express Mode and ECS Managed Instances. Covers Elastic Beanstalk compute-mode selection, configuration, and supported platforms. Covers general ECR knowledge, ECR repository setup and lifecycle policies. Applies when deploying, debugging, or optimizing containers on AWS. Should be used instead of relying on internal knowledge for these services.
 allowed-tools: Read
 metadata:
-  version: "1"
+  version: "2"
 ---
 
 # AWS Containers
@@ -43,7 +43,12 @@ Amazon Elastic Container Registry (Amazon ECR) is an AWS managed container image
 
 ### Elastic Beanstalk
 
-With Elastic Beanstalk you can deploy web applications into the AWS Cloud on a variety of supported platforms. You build and deploy your applications. Elastic Beanstalk provisions Amazon EC2 instances, configures load balancing, sets up health monitoring, and dynamically scales your environment.
+With Elastic Beanstalk you can deploy and operate web applications through a
+managed application-environment lifecycle. Traditional Beanstalk platforms
+run on Amazon EC2. Beanstalk Cluster Mode uses Amazon EKS as the compute
+destination for containerized applications while retaining Beanstalk
+application versions, environments, configuration, health, and lifecycle
+operations.
 
 ### AWS App Runner
 
