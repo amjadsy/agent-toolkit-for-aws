@@ -119,12 +119,50 @@ export function object(value: Json): JsonObject {
   return value;
 }
 
-function same(left: Json, right: Json): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
 function hasOwn(value: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function same(left: Json, right: Json): boolean {
+  const pending: Array<[Json, Json]> = [[left, right]];
+  while (pending.length > 0) {
+    const [leftValue, rightValue] = pending.pop() as [Json, Json];
+    if (Object.is(leftValue, rightValue)) continue;
+    if (
+      leftValue === null
+      || rightValue === null
+      || typeof leftValue !== "object"
+      || typeof rightValue !== "object"
+      || Array.isArray(leftValue) !== Array.isArray(rightValue)
+    ) return false;
+
+    if (Array.isArray(leftValue) && Array.isArray(rightValue)) {
+      if (leftValue.length !== rightValue.length) return false;
+      for (let index = leftValue.length - 1; index >= 0; index -= 1) {
+        pending.push([leftValue[index], rightValue[index]]);
+      }
+      continue;
+    }
+
+    const leftObject = leftValue as JsonObject;
+    const rightObject = rightValue as JsonObject;
+    const leftKeys = Object.keys(leftObject);
+    if (leftKeys.length !== Object.keys(rightObject).length) return false;
+    for (const key of leftKeys) {
+      if (!hasOwn(rightObject, key)) return false;
+      pending.push([leftObject[key], rightObject[key]]);
+    }
+  }
+  return true;
+}
+
+const MAX_VALIDATION_ERRORS = 100;
+
+function appendErrors(target: string[], additions: readonly string[], prefix = ""): void {
+  for (const error of additions) {
+    if (target.length >= MAX_VALIDATION_ERRORS) return;
+    target.push(`${prefix}${error}`);
+  }
 }
 
 function validateDefinition(
@@ -151,7 +189,10 @@ export function validate(node: JsonObject, value: Json, root: JsonObject = node,
   const errors: string[] = [];
 
   if (Array.isArray(node.allOf)) {
-    for (const part of node.allOf) errors.push(...validate(object(part), value, root, path));
+    for (const part of node.allOf) {
+      appendErrors(errors, validate(object(part), value, root, path));
+      if (errors.length >= MAX_VALIDATION_ERRORS) return errors;
+    }
   }
   if (Array.isArray(node.oneOf)) {
     const matches = node.oneOf.filter((part) => validate(object(part), value, root, path).length === 0);
@@ -162,7 +203,7 @@ export function validate(node: JsonObject, value: Json, root: JsonObject = node,
   }
   if (node.if) {
     const branch = validate(object(node.if), value, root, path).length === 0 ? node.then : node.else;
-    if (branch) errors.push(...validate(object(branch), value, root, path));
+    if (branch) appendErrors(errors, validate(object(branch), value, root, path));
   }
   if ("const" in node && !same(node.const, value)) errors.push(`${path}: does not match const`);
   if (Array.isArray(node.enum) && !node.enum.some((entry) => same(entry, value))) {
@@ -196,12 +237,18 @@ export function validate(node: JsonObject, value: Json, root: JsonObject = node,
   }
   if (Array.isArray(value)) {
     if (typeof node.minItems === "number" && value.length < node.minItems) errors.push(`${path}: too few items`);
-    if (typeof node.maxItems === "number" && value.length > node.maxItems) errors.push(`${path}: too many items`);
+    if (typeof node.maxItems === "number" && value.length > node.maxItems) {
+      errors.push(`${path}: too many items`);
+      return errors;
+    }
     if (node.uniqueItems === true && new Set(value.map((entry) => JSON.stringify(entry))).size !== value.length) {
       errors.push(`${path}: duplicate items`);
     }
     if (node.items) {
-      value.forEach((entry, index) => errors.push(...validate(object(node.items), entry, root, `${path}[${index}]`)));
+      for (const [index, entry] of value.entries()) {
+        appendErrors(errors, validate(object(node.items), entry, root, `${path}[${index}]`));
+        if (errors.length >= MAX_VALIDATION_ERRORS) break;
+      }
     }
   }
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
@@ -214,10 +261,14 @@ export function validate(node: JsonObject, value: Json, root: JsonObject = node,
     if (node.additionalProperties === false) {
       for (const key of Object.keys(value)) {
         if (!hasOwn(properties, key)) errors.push(`${path}: undeclared ${key}`);
+        if (errors.length >= MAX_VALIDATION_ERRORS) return errors;
       }
     }
     for (const [key, childSchema] of Object.entries(properties)) {
-      if (hasOwn(value, key)) errors.push(...validate(object(childSchema), value[key], root, `${path}.${key}`));
+      if (hasOwn(value, key)) {
+        appendErrors(errors, validate(object(childSchema), value[key], root, `${path}.${key}`));
+      }
+      if (errors.length >= MAX_VALIDATION_ERRORS) break;
     }
   }
   return errors;
@@ -390,28 +441,85 @@ const CREDENTIAL_PATTERNS: RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/, // PEM private key
   /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/, // Slack token
   /\bgh[pousr]_[0-9A-Za-z]{20,}\b/, // GitHub token
-  /\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*\b/i, // bearer token
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
   /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i, // URI userinfo
-  /--?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)(?:=|\s+)["']?(?!<|\*{3,}|\[|\$\{?[A-Z_])[^\s"'<>*\[\]]{8,}/i, // CLI literal
 ];
 
-const LITERAL_ASSIGNMENT_PATTERN =
-  /(?:^|[^A-Za-z0-9_])(?:"([A-Za-z_][A-Za-z0-9_.-]*)"|'([A-Za-z_][A-Za-z0-9_.-]*)'|([A-Za-z_][A-Za-z0-9_.-]*))\s*[:=]\s*["']?(?!<|\*{3,}|\[|\$\{?[A-Z_])[^\s"'<>*\[\]]{8,}/gu;
+const ASSIGNMENT_KEY_PATTERN =
+  /(?:^|[^A-Za-z0-9_])(?:"([A-Za-z_][A-Za-z0-9_.-]*)"|'([A-Za-z_][A-Za-z0-9_.-]*)'|([A-Za-z_][A-Za-z0-9_.-]*))\s*[:=]\s*/gu;
+const OPTION_KEY_PATTERN =
+  /(?:^|[\s;])--?([A-Za-z][A-Za-z0-9_-]*)\s*(?:=|\s+)\s*/gu;
+const BEARER_VALUE_PATTERN = /\bBearer\s+([A-Za-z0-9._~+/-]{12,}=*)(?=$|[\s,;"'])/giu;
 const CREDENTIAL_KEY_PARTS = new Set(["password", "passwd", "secret", "token", "apikey", "accesskey"]);
 
 function isCredentialKey(key: string): boolean {
-  const parts = key.toLowerCase().split(/[._-]+/u).filter(Boolean);
+  const separated = key
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, "$1_$2");
+  const parts = separated.toLowerCase().split(/[._-]+/u).filter(Boolean);
   return parts.some((part, index) =>
     CREDENTIAL_KEY_PARTS.has(part)
     || ((part === "api" || part === "access") && parts[index + 1] === "key")
   );
 }
 
+function readAssignedValue(text: string, start: number): string {
+  let index = start;
+  while (index < text.length && /\s/u.test(text[index])) index += 1;
+  const quote = text[index];
+  if (quote === "\"" || quote === "'") {
+    let end = index + 1;
+    while (end < text.length) {
+      if (text[end] === quote && text[end - 1] !== "\\") break;
+      end += 1;
+    }
+    return text.slice(index + 1, end);
+  }
+
+  let end = index;
+  while (end < text.length && !/[\s;,]/u.test(text[end])) end += 1;
+  return text.slice(index, end);
+}
+
+function isSafeCredentialPlaceholder(value: string): boolean {
+  const candidate = value.trim();
+  return candidate.length === 0
+    || /^<[^>]+>$/u.test(candidate)
+    || /^\*{3,}$/u.test(candidate)
+    || /^\[[^\]]+\]$/u.test(candidate)
+    || /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(candidate);
+}
+
+function patternContainsLiteralCredential(
+  text: string,
+  pattern: RegExp,
+  keyForMatch: (match: RegExpMatchArray) => string | undefined,
+): boolean {
+  for (const match of text.matchAll(pattern)) {
+    const key = keyForMatch(match);
+    if (!key || !isCredentialKey(key) || match.index === undefined) continue;
+    const value = readAssignedValue(text, match.index + match[0].length);
+    if (!isSafeCredentialPlaceholder(value)) return true;
+  }
+  return false;
+}
+
 function hasLiteralCredentialAssignment(text: string): boolean {
-  for (const match of text.matchAll(LITERAL_ASSIGNMENT_PATTERN)) {
-    const key = match[1] ?? match[2] ?? match[3];
-    if (key && isCredentialKey(key)) return true;
+  return patternContainsLiteralCredential(
+    text,
+    ASSIGNMENT_KEY_PATTERN,
+    (match) => match[1] ?? match[2] ?? match[3],
+  ) || patternContainsLiteralCredential(text, OPTION_KEY_PATTERN, (match) => match[1]);
+}
+
+function hasBearerCredential(text: string): boolean {
+  for (const match of text.matchAll(BEARER_VALUE_PATTERN)) {
+    const value = match[1];
+    if (
+      value
+      && !isSafeCredentialPlaceholder(value)
+      && value.toLowerCase() !== "authentication"
+    ) return true;
   }
   return false;
 }
@@ -429,8 +537,11 @@ function walkStrings(value: Json, visit: (text: string) => void): void {
   while (pending.length > 0) {
     const current = pending.pop() as Json;
     if (typeof current === "string") visit(current);
-    else if (Array.isArray(current)) pending.push(...current);
-    else if (current !== null && typeof current === "object") pending.push(...Object.values(current));
+    else if (Array.isArray(current)) {
+      for (const item of current) pending.push(item);
+    } else if (current !== null && typeof current === "object") {
+      for (const item of Object.values(current)) pending.push(item);
+    }
   }
 }
 
@@ -438,9 +549,14 @@ function scanCredentialContent(value: Json): string[] {
   const reasons: string[] = [];
   walkStrings(value, (text) => {
     for (const pattern of CREDENTIAL_PATTERNS) {
-      if (pattern.test(text)) reasons.push(`high-confidence credential in output: ${pattern.source}`);
+      if (pattern.test(text) && reasons.length < MAX_VALIDATION_ERRORS) {
+        reasons.push(`high-confidence credential in output: ${pattern.source}`);
+      }
     }
-    if (hasLiteralCredentialAssignment(text)) {
+    if (hasBearerCredential(text) && reasons.length < MAX_VALIDATION_ERRORS) {
+      reasons.push("high-confidence credential in output: bearer token");
+    }
+    if (hasLiteralCredentialAssignment(text) && reasons.length < MAX_VALIDATION_ERRORS) {
       reasons.push("high-confidence credential in output: literal assignment");
     }
   });
@@ -453,7 +569,9 @@ export function scanDisallowedContent(answer: JsonObject): string[] {
   const reasons = scanCredentialContent(content);
   walkStrings(content, (text) => {
     for (const pattern of TARGET_PATTERNS) {
-      if (pattern.test(text)) reasons.push(`target/architecture/cost content in output: ${pattern.source}`);
+      if (pattern.test(text) && reasons.length < MAX_VALIDATION_ERRORS) {
+        reasons.push(`target/architecture/cost content in output: ${pattern.source}`);
+      }
     }
   });
   return reasons;
@@ -651,7 +769,7 @@ const ALLOWED_UNKNOWN_DETAILS = new Set([VALIDATION_UNKNOWN_DETAIL, ...Object.va
 /** One deterministic UNKNOWN finding per requested question — the fail-closed output. */
 export function unknownForRequest(requestedQuestions: readonly string[], detail: string): JsonObject {
   return {
-    findings: requestedQuestions.map((question) => ({
+    findings: requestedQuestions.slice(0, QUESTIONS.length).map((question) => ({
       question,
       status: "UNKNOWN",
       value: null,
@@ -681,7 +799,7 @@ function validateRequest(schema: JsonObject, request: JsonObject, path: string):
   const errors = validateDefinition(schema, "request", request, path);
   if (errors.length > 0) return errors;
 
-  errors.push(...scanCredentialContent(request).map((error) => `${path}: ${error}`));
+  appendErrors(errors, scanCredentialContent(request), `${path}: `);
   return errors;
 }
 
@@ -705,6 +823,7 @@ export function validateReviewArtifact(
 
   const appIds = new Set<string>();
   for (const [index, raw] of artifact.reviews.entries()) {
+    if (errors.length >= MAX_VALIDATION_ERRORS) break;
     const entry = jsonObject(raw);
     const at = `reviews[${index}]`;
     if (!entry || !hasExactKeys(entry, ["findings", "limitations", "request", "source_root", "status"])) {
@@ -718,10 +837,14 @@ export function validateReviewArtifact(
       continue;
     }
     const requestErrors = validateRequest(schema, request, `${at}.request`);
-    const findingErrors = validateDefinition(schema, "findings", findings, `${at}.findings`);
-    errors.push(...requestErrors, ...findingErrors);
+    const findingBytes = retainedBytes(findings);
+    const findingErrors = findingBytes > LIMITS.maxRetainedBytes
+      ? [`${at}.findings: retained output ${findingBytes} bytes exceeds ${LIMITS.maxRetainedBytes}`]
+      : validateDefinition(schema, "findings", findings, `${at}.findings`);
+    appendErrors(errors, requestErrors);
+    appendErrors(errors, findingErrors);
     if (requestErrors.length > 0 || findingErrors.length > 0) continue;
-    errors.push(...validateSemantics(request, findings).map((error) => `${at}: ${error}`));
+    appendErrors(errors, validateSemantics(request, findings), `${at}: `);
 
     const application = jsonObject(request.application);
     const appId = application?.app_id;
@@ -733,11 +856,13 @@ export function validateReviewArtifact(
     }
 
     const limitations = Array.isArray(entry.limitations) ? entry.limitations : [];
+    const validLimitations = Array.isArray(entry.limitations)
+      && limitations.length <= MAX_VALIDATION_ERRORS
+      && limitations.every((item) => typeof item === "string" && item.length > 0 && item.length <= 500);
     if (
-      !Array.isArray(entry.limitations)
-      || limitations.some((item) => typeof item !== "string" || item.length === 0 || item.length > 500)
+      !validLimitations
     ) errors.push(`${at}: limitations must be concise strings`);
-    errors.push(...scanDisallowedContent({ findings: limitations }).map((error) => `${at}: ${error}`));
+    else appendErrors(errors, scanDisallowedContent({ findings: limitations }), `${at}: `);
 
     const sourceRoot = entry.source_root;
     if (sourceRoot !== null && (typeof sourceRoot !== "string" || !validRelativeRoot(sourceRoot))) {
@@ -754,7 +879,7 @@ export function validateReviewArtifact(
           workspaceRoot,
           roots: [resolve(workspaceRoot, sourceRoot)],
         });
-        errors.push(...result.reasons.map((reason) => `${at}: ${reason}`));
+        appendErrors(errors, result.reasons, `${at}: `);
       }
       if (limitations.length !== 0) errors.push(`${at}: RETAINED cannot have limitations`);
     } else if (entry.status === "UNKNOWN") {
@@ -771,8 +896,7 @@ export function validateReviewArtifact(
         || !ALLOWED_UNKNOWN_DETAILS.has(detail)
         || !same(findings, unknownForRequest(requested, detail))
       ) errors.push(`${at}: UNKNOWN findings must be a canonical fail-closed replacement`);
-      if (retainedBytes(findings) > LIMITS.maxRetainedBytes) errors.push(`${at}: findings exceed retained budget`);
-      errors.push(...scanDisallowedContent(findings).map((error) => `${at}: ${error}`));
+      appendErrors(errors, scanDisallowedContent(findings), `${at}: `);
     } else {
       errors.push(`${at}: status must be RETAINED or UNKNOWN`);
     }
@@ -801,18 +925,22 @@ export interface SubmissionResult {
  */
 export function evaluateSubmission(ctx: SubmissionContext): SubmissionResult {
   const reasons: string[] = [];
-  reasons.push(...validateRequest(ctx.schema, ctx.request, "request").map((error) => `request ${error}`));
-  reasons.push(...validateDefinition(ctx.schema, "findings", ctx.submission, "findings").map((error) => `findings ${error}`));
-  if (reasons.length === 0) {
-    reasons.push(...validateSemantics(ctx.request, ctx.submission));
-    reasons.push(...validateRuntimeSupport(ctx.request, ctx.submission));
-  }
-  reasons.push(...scanDisallowedContent(ctx.submission));
+  const requestErrors = validateRequest(ctx.schema, ctx.request, "request");
+  appendErrors(reasons, requestErrors, "request ");
 
   const bytes = retainedBytes(ctx.submission);
-  if (bytes > LIMITS.maxRetainedBytes) reasons.push(`retained output ${bytes} bytes exceeds ${LIMITS.maxRetainedBytes}`);
+  const findingErrors = bytes > LIMITS.maxRetainedBytes
+    ? [`retained output ${bytes} bytes exceeds ${LIMITS.maxRetainedBytes}`]
+    : validateDefinition(ctx.schema, "findings", ctx.submission, "findings");
+  appendErrors(reasons, findingErrors, "findings ");
 
-  reasons.push(...validateSourceRoots(ctx.workspaceRoot, ctx.roots));
+  if (requestErrors.length === 0 && findingErrors.length === 0) {
+    appendErrors(reasons, validateSemantics(ctx.request, ctx.submission));
+    appendErrors(reasons, validateRuntimeSupport(ctx.request, ctx.submission));
+    appendErrors(reasons, scanDisallowedContent(ctx.submission));
+  }
+
+  appendErrors(reasons, validateSourceRoots(ctx.workspaceRoot, ctx.roots));
 
   if (reasons.length === 0) {
     for (const raw of ctx.submission.findings as Json[]) {
@@ -820,16 +948,26 @@ export function evaluateSubmission(ctx: SubmissionContext): SubmissionResult {
       for (const source of (finding.sources ?? []) as JsonObject[]) {
         if (!citationResolves(ctx.roots, ctx.workspaceRoot, source)) {
           reasons.push(`${String(finding.question)}: cited path does not resolve within workspace`);
+          if (reasons.length >= MAX_VALIDATION_ERRORS) break;
         }
       }
+      if (reasons.length >= MAX_VALIDATION_ERRORS) break;
     }
   }
 
   if (reasons.length === 0) return { retained: true, findings: ctx.submission, reasons: [] };
   const rawRequested = ctx.request.requested_questions;
-  const requested = Array.isArray(rawRequested)
-    ? rawRequested.filter((question): question is string => typeof question === "string")
-    : [];
+  const requested: Question[] = [];
+  if (Array.isArray(rawRequested)) {
+    for (const question of rawRequested) {
+      if (
+        typeof question === "string"
+        && QUESTIONS.includes(question as Question)
+        && !requested.includes(question as Question)
+      ) requested.push(question as Question);
+      if (requested.length >= QUESTIONS.length) break;
+    }
+  }
   return {
     retained: false,
     findings: unknownForRequest(requested, VALIDATION_UNKNOWN_DETAIL),

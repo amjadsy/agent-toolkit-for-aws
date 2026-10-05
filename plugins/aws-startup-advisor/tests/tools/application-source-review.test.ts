@@ -333,6 +333,46 @@ describe('evaluateSubmission: retain vs fail closed', () => {
     assert.equal(evaluateSubmission({ ...base, request: request(['build_method']), submission: unrequested }).retained, false);
   });
 
+  it('fails closed without throwing on malformed wide submissions', () => {
+    const ws = makeWorkspace({ 'package.json': '{}\n' });
+    const malformedCases: Array<[JsonObject, JsonObject]> = [
+      [
+        request(['runtime_framework']),
+        { findings: { unexpected: Array(130_000).fill(0) } },
+      ],
+      [
+        request(['runtime_framework']),
+        { findings: { unexpected: Array(140_000).fill(0) } },
+      ],
+      [
+        request(['build_time_settings']),
+        findings([{
+          question: 'build_time_settings',
+          status: 'PRESENT',
+          value: Array(125_000).fill(0),
+          sources: [],
+          limitations: [],
+        }]),
+      ],
+    ];
+    assert.ok(retainedBytes(malformedCases[1][1]) > LIMITS.maxRetainedBytes);
+
+    for (const [reviewRequest, submission] of malformedCases) {
+      let result;
+      assert.doesNotThrow(() => {
+        result = evaluateSubmission({
+          schema,
+          request: reviewRequest,
+          submission,
+          roots: [ws],
+          workspaceRoot: ws,
+        });
+      });
+      assert.equal(result?.retained, false);
+      assert.ok((result?.reasons.length ?? 0) <= 100);
+    }
+  });
+
   it('fails closed and replaces wholesale on target-bearing output', () => {
     const ws = makeWorkspace({ 'package.json': '{\n}\n' });
     const tainted = findings([{
@@ -472,6 +512,100 @@ describe('final review artifact validation', () => {
     assert.match(validateReviewArtifact(schema, extra, ws, [retainedRequest]).join('\n'), /invalid entry shape/);
   });
 
+  it('compares request objects independent of key order but preserves array order', () => {
+    const ws = makeWorkspace({ 'package.json': '{\n  "name": "app"\n}\n' });
+    const expected = request(['runtime_framework']);
+    const actual = {
+      context: { ...object(expected.context) },
+      requested_questions: [...expected.requested_questions as Json[]],
+      application: {
+        app_name: object(expected.application).app_name,
+        app_id: object(expected.application).app_id,
+      },
+    };
+    assert.deepEqual(validateReviewArtifact(schema, retainedArtifact(actual), ws, [expected]), []);
+
+    const reorderedUnknown = {
+      reviews: [{
+        source_root: null,
+        request: actual,
+        status: 'UNKNOWN',
+        findings: {
+          findings: [{
+            limitations: [{ detail: MISSING_SOURCE_DETAIL, kind: 'OTHER' }],
+            sources: [],
+            value: null,
+            status: 'UNKNOWN',
+            question: 'runtime_framework',
+          }],
+        },
+        limitations: [MISSING_SOURCE_DETAIL],
+      }],
+    };
+    assert.deepEqual(validateReviewArtifact(schema, reorderedUnknown, ws, [expected]), []);
+
+    const requestedInOrder = request(['runtime_framework', 'build_method']);
+    const requestedInReverse = request(['build_method', 'runtime_framework']);
+    const reversedArtifact = {
+      reviews: [{
+        source_root: null,
+        request: requestedInReverse,
+        status: 'UNKNOWN',
+        findings: unknownForRequest(
+          requestedInReverse.requested_questions as string[],
+          MISSING_SOURCE_DETAIL,
+        ),
+        limitations: [MISSING_SOURCE_DETAIL],
+      }],
+    };
+    assert.match(
+      validateReviewArtifact(schema, reversedArtifact, ws, [requestedInOrder]).join('\n'),
+      /request content or inventory order does not match/,
+    );
+  });
+
+  it('rejects malformed wide findings without throwing', () => {
+    const ws = makeWorkspace({ 'package.json': '{}\n' });
+    const malformedCases: Array<[JsonObject, JsonObject]> = [
+      [
+        request(['runtime_framework']),
+        { findings: { unexpected: Array(130_000).fill(0) } },
+      ],
+      [
+        request(['runtime_framework']),
+        { findings: { unexpected: Array(140_000).fill(0) } },
+      ],
+      [
+        request(['build_time_settings']),
+        findings([{
+          question: 'build_time_settings',
+          status: 'PRESENT',
+          value: Array(125_000).fill(0),
+          sources: [],
+          limitations: [],
+        }]),
+      ],
+    ];
+
+    for (const [reviewRequest, malformedFindings] of malformedCases) {
+      const artifact = {
+        reviews: [{
+          source_root: '.',
+          request: reviewRequest,
+          status: 'RETAINED',
+          findings: malformedFindings,
+          limitations: [],
+        }],
+      };
+      let errors: string[] = [];
+      assert.doesNotThrow(() => {
+        errors = validateReviewArtifact(schema, artifact, ws, [reviewRequest]);
+      });
+      assert.ok(errors.length > 0);
+      assert.ok(errors.length <= 100);
+    }
+  });
+
   it('rejects non-canonical UNKNOWN findings and wrong document types', () => {
     const ws = makeWorkspace({ 'package.json': '{}\n' });
     const unknownRequest = publicationRequest();
@@ -496,6 +630,88 @@ describe('final review artifact validation', () => {
 // --- configuration names vs credentials ---------------------------------------
 
 describe('configuration names vs literal credentials', () => {
+  function processCommandReview(command: string): {
+    artifact: JsonObject;
+    reviewRequest: JsonObject;
+    submission: JsonObject;
+    workspace: string;
+  } {
+    const workspace = makeWorkspace({ 'Procfile': `web: ${command}\n` });
+    const reviewRequest = request(['process_commands']);
+    const submission = findings([{
+      question: 'process_commands',
+      status: 'PRESENT',
+      value: [{
+        process_id: 'process-web',
+        component_id: 'component-api',
+        type: 'web',
+        name: 'web',
+        command,
+      }],
+      sources: [{ path: 'Procfile', line_start: 1, line_end: 1 }],
+      limitations: [],
+    }]);
+    return {
+      workspace,
+      reviewRequest,
+      submission,
+      artifact: {
+        reviews: [{
+          source_root: '.',
+          request: reviewRequest,
+          status: 'RETAINED',
+          findings: submission,
+          limitations: [],
+        }],
+      },
+    };
+  }
+
+  function assertCommandAccepted(command: string): void {
+    const review = processCommandReview(command);
+    const result = evaluateSubmission({
+      schema,
+      request: review.reviewRequest,
+      submission: review.submission,
+      roots: [review.workspace],
+      workspaceRoot: review.workspace,
+    });
+    assert.equal(result.retained, true, command);
+    assert.deepEqual(
+      validateReviewArtifact(
+        schema,
+        review.artifact,
+        review.workspace,
+        [review.reviewRequest],
+      ),
+      [],
+      command,
+    );
+  }
+
+  function assertCommandRejected(command: string): void {
+    const review = processCommandReview(command);
+    const result = evaluateSubmission({
+      schema,
+      request: review.reviewRequest,
+      submission: review.submission,
+      roots: [review.workspace],
+      workspaceRoot: review.workspace,
+    });
+    assert.equal(result.retained, false, command);
+    assert.match(result.reasons.join('\n'), /high-confidence credential/, command);
+    assert.match(
+      validateReviewArtifact(
+        schema,
+        review.artifact,
+        review.workspace,
+        [review.reviewRequest],
+      ).join('\n'),
+      /high-confidence credential/,
+      command,
+    );
+  }
+
   it('allows secret-bearing configuration names without values', () => {
     for (
       const settingName of [
@@ -553,6 +769,57 @@ describe('configuration names vs literal credentials', () => {
     }
   });
 
+  it('accepts lowercase environment references and redacted camelCase credentials', () => {
+    for (const command of [
+      'DATABASE_PASSWORD=${database_password} node app.js',
+      'DATABASE_PASSWORD=$database_password node app.js',
+      'node app.js --password=${database_password}',
+      `node app.js --config='{"clientSecret":"<redacted>"}'`,
+      'java -Dservice.clientSecret=${client_secret} -jar app.jar',
+    ]) assertCommandAccepted(command);
+  });
+
+  it('accepts Bearer authentication as a description at both validation boundaries', () => {
+    const ws = makeWorkspace({ 'config/auth.json': '{}\n' });
+    const reviewRequest = request(['external_services']);
+    const submission = findings([{
+      question: 'external_services',
+      status: 'PRESENT',
+      value: [{
+        dependency_id: 'external-api',
+        component_id: 'component-api',
+        process_ids: [],
+        direction: 'OUTBOUND',
+        category: 'API',
+        service_reference: 'Example API',
+        setting_name: 'EXAMPLE_API_URL',
+        role: 'reads customer records',
+        protocol: 'https',
+        authentication_mechanism: 'Bearer authentication',
+        allowlist_behavior: 'unknown',
+      }],
+      sources: [{ path: 'config/auth.json', line_start: 1, line_end: 1 }],
+      limitations: [],
+    }]);
+    const result = evaluateSubmission({
+      schema,
+      request: reviewRequest,
+      submission,
+      roots: [ws],
+      workspaceRoot: ws,
+    });
+    assert.equal(result.retained, true);
+    assert.deepEqual(validateReviewArtifact(schema, {
+      reviews: [{
+        source_root: '.',
+        request: reviewRequest,
+        status: 'RETAINED',
+        findings: submission,
+        limitations: [],
+      }],
+    }, ws, [reviewRequest]), []);
+  });
+
   it('rejects a high-confidence literal credential', () => {
     const leaked = findings([{
       question: 'process_commands',
@@ -575,47 +842,18 @@ describe('configuration names vs literal credentials', () => {
       'java -Dservice.access-key=syntheticVerifyValue123 -jar app.jar',
       `node app.js --config='{"password":"syntheticVerifyValue123"}'`,
       `node app.js --config='{"token":"syntheticVerifyValue123"}'`,
+      'JAVA_TOOL_OPTIONS=-Dservice.password=syntheticExample123',
+      'JAVA_TOOL_OPTIONS="-Dservice.password=syntheticExample123"',
+      'OPT=value1234;DATABASE_PASSWORD=syntheticExample123',
+      'DATABASE_PASSWORD=abc1234',
+      'node app.js --password=abc1234',
+      `node app.js --config='{"password":"abc1234"}'`,
+      `node app.js --config='{"clientSecret":"SyntheticReviewOnly987654"}'`,
+      'java -Dservice.clientSecret=SyntheticReviewOnly987654 -jar app.jar',
+      'curl -H "Authorization: Bearer syntheticTokenValue123" https://example.test',
+      'curl -H "Authorization: Bearer syntheticTokenValue" https://example.test',
     ]) {
-      const ws = makeWorkspace({ 'Procfile': `web: ${command}\n` });
-      const reviewRequest = request(['process_commands']);
-      const submission = findings([{
-        question: 'process_commands',
-        status: 'PRESENT',
-        value: [{
-          process_id: 'process-web',
-          component_id: 'component-api',
-          type: 'web',
-          name: 'web',
-          command,
-        }],
-        sources: [{ path: 'Procfile', line_start: 1, line_end: 1 }],
-        limitations: [],
-      }]);
-
-      const result = evaluateSubmission({
-        schema,
-        request: reviewRequest,
-        submission,
-        roots: [ws],
-        workspaceRoot: ws,
-      });
-      assert.equal(result.retained, false);
-      assert.match(result.reasons.join('\n'), /high-confidence credential/);
-      assert.equal(object((result.findings.findings as Json[])[0]).status, 'UNKNOWN');
-
-      const artifact = {
-        reviews: [{
-          source_root: '.',
-          request: reviewRequest,
-          status: 'RETAINED',
-          findings: submission,
-          limitations: [],
-        }],
-      };
-      assert.match(
-        validateReviewArtifact(schema, artifact, ws, [reviewRequest]).join('\n'),
-        /high-confidence credential/,
-      );
+      assertCommandRejected(command);
     }
   });
 
