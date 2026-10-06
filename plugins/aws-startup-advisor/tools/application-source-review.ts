@@ -449,7 +449,10 @@ const ASSIGNMENT_KEY_PATTERN =
   /(?:^|[^A-Za-z0-9_])(?:"([A-Za-z_][A-Za-z0-9_.-]*)"|'([A-Za-z_][A-Za-z0-9_.-]*)'|([A-Za-z_][A-Za-z0-9_.-]*))\s*[:=]\s*/gu;
 const OPTION_KEY_PATTERN =
   /(?:^|[\s;])--?([A-Za-z][A-Za-z0-9_-]*)\s*(?:=|\s+)\s*/gu;
-const BEARER_VALUE_PATTERN = /\bBearer\s+([A-Za-z0-9._~+/-]{12,}=*)(?=$|[\s,;"'])/giu;
+const JAVA_PROPERTY_KEY_PATTERN =
+  /(?:^|[^A-Za-z0-9_])-D([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*/gu;
+const BEARER_VALUE_PATTERN =
+  /\bBearer\s+([A-Za-z0-9._~+/-]{12,}=*)(?=$|[^A-Za-z0-9._~+\/=-])/giu;
 const CREDENTIAL_KEY_PARTS = new Set(["password", "passwd", "secret", "token", "apikey", "accesskey"]);
 
 function isCredentialKey(key: string): boolean {
@@ -505,11 +508,12 @@ function patternContainsLiteralCredential(
 }
 
 function hasLiteralCredentialAssignment(text: string): boolean {
-  return patternContainsLiteralCredential(
-    text,
-    ASSIGNMENT_KEY_PATTERN,
-    (match) => match[1] ?? match[2] ?? match[3],
-  ) || patternContainsLiteralCredential(text, OPTION_KEY_PATTERN, (match) => match[1]);
+  return patternContainsLiteralCredential(text, JAVA_PROPERTY_KEY_PATTERN, (match) => match[1])
+    || patternContainsLiteralCredential(
+      text,
+      ASSIGNMENT_KEY_PATTERN,
+      (match) => match[1] ?? match[2] ?? match[3],
+    ) || patternContainsLiteralCredential(text, OPTION_KEY_PATTERN, (match) => match[1]);
 }
 
 function hasBearerCredential(text: string): boolean {
@@ -579,7 +583,11 @@ export function scanDisallowedContent(answer: JsonObject): string[] {
 
 /** Retained output must be at most 256 KiB per application. */
 export function retainedBytes(answer: JsonObject): number {
-  return new TextEncoder().encode(JSON.stringify(answer)).length;
+  try {
+    return new TextEncoder().encode(JSON.stringify(answer)).length;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
 }
 
 // --- filesystem containment + budgets -----------------------------------------
@@ -837,10 +845,17 @@ export function validateReviewArtifact(
       continue;
     }
     const requestErrors = validateRequest(schema, request, `${at}.request`);
-    const findingBytes = retainedBytes(findings);
-    const findingErrors = findingBytes > LIMITS.maxRetainedBytes
-      ? [`${at}.findings: retained output ${findingBytes} bytes exceeds ${LIMITS.maxRetainedBytes}`]
-      : validateDefinition(schema, "findings", findings, `${at}.findings`);
+    const findingErrors = validateDefinition(schema, "findings", findings, `${at}.findings`);
+    if (findingErrors.length === 0) {
+      const findingBytes = retainedBytes(findings);
+      if (!Number.isFinite(findingBytes)) {
+        findingErrors.push(`${at}.findings: retained output could not be measured`);
+      } else if (findingBytes > LIMITS.maxRetainedBytes) {
+        findingErrors.push(
+          `${at}.findings: retained output ${findingBytes} bytes exceeds ${LIMITS.maxRetainedBytes}`,
+        );
+      }
+    }
     appendErrors(errors, requestErrors);
     appendErrors(errors, findingErrors);
     if (requestErrors.length > 0 || findingErrors.length > 0) continue;
@@ -928,10 +943,15 @@ export function evaluateSubmission(ctx: SubmissionContext): SubmissionResult {
   const requestErrors = validateRequest(ctx.schema, ctx.request, "request");
   appendErrors(reasons, requestErrors, "request ");
 
-  const bytes = retainedBytes(ctx.submission);
-  const findingErrors = bytes > LIMITS.maxRetainedBytes
-    ? [`retained output ${bytes} bytes exceeds ${LIMITS.maxRetainedBytes}`]
-    : validateDefinition(ctx.schema, "findings", ctx.submission, "findings");
+  const findingErrors = validateDefinition(ctx.schema, "findings", ctx.submission, "findings");
+  if (findingErrors.length === 0) {
+    const bytes = retainedBytes(ctx.submission);
+    if (!Number.isFinite(bytes)) {
+      findingErrors.push("retained output could not be measured");
+    } else if (bytes > LIMITS.maxRetainedBytes) {
+      findingErrors.push(`retained output ${bytes} bytes exceeds ${LIMITS.maxRetainedBytes}`);
+    }
+  }
   appendErrors(reasons, findingErrors, "findings ");
 
   if (requestErrors.length === 0 && findingErrors.length === 0) {

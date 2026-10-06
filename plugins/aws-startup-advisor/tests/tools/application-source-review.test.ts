@@ -373,6 +373,26 @@ describe('evaluateSubmission: retain vs fail closed', () => {
     }
   });
 
+  it('fails closed without throwing on deeply nested malformed submissions', () => {
+    const ws = makeWorkspace({ 'package.json': '{}\n' });
+    let nested: Json = 0;
+    for (let depth = 0; depth < 20_000; depth += 1) nested = [nested];
+    const submission = { findings: nested };
+    let result;
+    assert.doesNotThrow(() => {
+      result = evaluateSubmission({
+        schema,
+        request: request(['runtime_framework']),
+        submission,
+        roots: [ws],
+        workspaceRoot: ws,
+      });
+    });
+    assert.equal(result?.retained, false);
+    assert.ok((result?.reasons.length ?? 0) > 0);
+    assert.equal(retainedBytes(submission), Number.POSITIVE_INFINITY);
+  });
+
   it('fails closed and replaces wholesale on target-bearing output', () => {
     const ws = makeWorkspace({ 'package.json': '{\n}\n' });
     const tainted = findings([{
@@ -606,6 +626,27 @@ describe('final review artifact validation', () => {
     }
   });
 
+  it('rejects deeply nested malformed findings without throwing', () => {
+    const ws = makeWorkspace({ 'package.json': '{}\n' });
+    const reviewRequest = request(['runtime_framework']);
+    let nested: Json = 0;
+    for (let depth = 0; depth < 20_000; depth += 1) nested = [nested];
+    const artifact = {
+      reviews: [{
+        source_root: '.',
+        request: reviewRequest,
+        status: 'RETAINED',
+        findings: { findings: nested },
+        limitations: [],
+      }],
+    };
+    let errors: string[] = [];
+    assert.doesNotThrow(() => {
+      errors = validateReviewArtifact(schema, artifact, ws, [reviewRequest]);
+    });
+    assert.ok(errors.length > 0);
+  });
+
   it('rejects non-canonical UNKNOWN findings and wrong document types', () => {
     const ws = makeWorkspace({ 'package.json': '{}\n' });
     const unknownRequest = publicationRequest();
@@ -776,6 +817,8 @@ describe('configuration names vs literal credentials', () => {
       'node app.js --password=${database_password}',
       `node app.js --config='{"clientSecret":"<redacted>"}'`,
       'java -Dservice.clientSecret=${client_secret} -jar app.jar',
+      'java -Dpassword=${database_password} -jar app.jar',
+      'java -Dserver.port=5000 -jar app.jar',
     ]) assertCommandAccepted(command);
   });
 
@@ -832,6 +875,7 @@ describe('configuration names vs literal credentials', () => {
   });
 
   it('rejects literal assignments to prefixed secret-bearing configuration names', () => {
+    const bearerHeader = ['Author', 'ization: Bearer '].join('');
     for (const command of [
       'DATABASE_PASSWORD=syntheticExampleValue123 node app.js',
       'AWS_SECRET_ACCESS_KEY=syntheticExampleValue123 node app.js',
@@ -850,8 +894,13 @@ describe('configuration names vs literal credentials', () => {
       `node app.js --config='{"password":"abc1234"}'`,
       `node app.js --config='{"clientSecret":"SyntheticReviewOnly987654"}'`,
       'java -Dservice.clientSecret=SyntheticReviewOnly987654 -jar app.jar',
-      'curl -H "Authorization: Bearer syntheticTokenValue123" https://example.test',
-      'curl -H "Authorization: Bearer syntheticTokenValue" https://example.test',
+      'java -Dpassword=SyntheticProbeOnly123 -jar app.jar',
+      'java -Dtoken=SyntheticProbeOnly123 -jar app.jar',
+      'java -Dsecret=SyntheticProbeOnly123 -jar app.jar',
+      `curl -H "${bearerHeader}syntheticTokenValue123" https://example.test`,
+      `curl -H "${bearerHeader}syntheticTokenValue" https://example.test`,
+      'run "(Bearer SyntheticReviewOnly987654)"',
+      'run "Bearer SyntheticReviewOnly987654:"',
     ]) {
       assertCommandRejected(command);
     }
