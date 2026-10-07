@@ -12,6 +12,13 @@ description: "Migrate workloads from Microsoft Azure to AWS. Triggers on: migrat
 > sidebar (wiring only); and `patterns.md`, `licensing.md`, and `gpu-hpc.md`.
 > The live `az` capture path is implemented (`discover-live.md`).
 
+## Optional usage telemetry
+
+Before starting or resuming, load `references/vendored/telemetry/PROTOCOL.md` and
+run its read-only status check. Use the returned reporting mode rather than the
+model's identity. Complete the existing notice exchange only when that protocol
+requires it; unavailable or declined telemetry never blocks this skill.
+
 ## Philosophy
 
 - **Re-platform by default**: pick the AWS service that matches the Azure workload type (App Service → Elastic Beanstalk, AKS → EKS, VMs → EC2, Flexible Server → RDS/Aurora, Azure Cache for Redis → ElastiCache). Re-architecting is a user decision, not a default.
@@ -106,6 +113,28 @@ migrations. A `preferences.json` that was not produced by an actual Clarify run
 does not count. Azure estates make this stricter, not looser: licensing posture and
 App Service Plan isolation are not inferable from configuration, and getting either
 wrong moves the estimate by multiples.
+
+**Clarify has a fast path, and the fast path is still Clarify.** When Discover marks
+the estate eligible (`azure-resource-inventory.json` → `metadata.clarify_fast_path`,
+`discover-assemble.md` § Assembly rule 9 — no AI, no Windows/SQL licensing signal, no
+VMs, no Cosmos Core, no HA database, one region, small cluster count), `clarify.md`
+§ Step 0.5 offers to ask only the ESSENTIAL rows (compliance; baseline spend when no
+billing source exists) and apply documented defaults for the rest. Every fragment
+still runs and every row is still recorded. The defaults are shown **next to the
+estimate** (`estimate-assemble.md` § Step 2 "Assumptions behind this number"), not as
+a gate before it, so a correction is judged against the dollars it moves; the
+plan-isolation default always appears there with its cost consequence. The eligibility
+rule exists precisely so that the two cases named above — licensing, and any other row
+with no defensible default — never reach the short path.
+
+**Execution-only questions are asked at execution time.** `data.db_cutover` (DMS vs
+dump/restore) is consumed by Generate's runbook and by one Estimate line; Clarify
+records a size-derived default (or the documented unknown-size fallback when no database
+size was measured) and marks it `deferred_to_generate`, and the Decision
+gate's **[C] Generate** asks it for real (`estimate-assemble.md` § Step 3b) before
+`generate.md` loads. A user who stops at the decision never answers it; a user who
+generates always does. `vm_cutover` stays ESSENTIAL in Clarify because MGN-vs-rebuild
+has no defensible default to defer with.
 
 **Generate requires `run_mode: decide_and_execute`.** `estimate-assemble.md` owns
 presenting the post-Estimate decision gate and writing `run_mode` into
